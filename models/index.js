@@ -1,37 +1,43 @@
-'use strict';
+const { Sequelize, DataTypes } = require("sequelize");
+const dbConfig = require("../config/db.config");
 
-const fs = require('fs');
-const path = require('path');
-const Sequelize = require('sequelize');
-const basename = path.basename(__filename);
-const env = process.env.NODE_ENV || 'development';
-const config = require(__dirname + '/../config/config.json')[env];
-const db = {};
-
-let sequelize;
-if (config.use_env_variable) {
-  sequelize = new Sequelize(process.env[config.use_env_variable], config);
-} else {
-  sequelize = new Sequelize(config.database, config.username, config.password, config);
-}
-
-fs
-  .readdirSync(__dirname)
-  .filter(file => {
-    return (file.indexOf('.') !== 0) && (file !== basename) && (file.slice(-3) === '.js');
-  })
-  .forEach(file => {
-    const model = sequelize['import'](path.join(__dirname, file));
-    db[model.name] = model;
-  });
-
-Object.keys(db).forEach(modelName => {
-  if (db[modelName].associate) {
-    db[modelName].associate(db);
-  }
+const sequelize = new Sequelize(dbConfig.DB, dbConfig.USER, dbConfig.PASSWORD, {
+  host: dbConfig.HOST,
+  dialect: dbConfig.DIALECT,
+  logging: false
 });
 
-db.sequelize = sequelize;
+// Initialize models
+const db = {};
 db.Sequelize = Sequelize;
+db.sequelize = sequelize;
+
+db.User = require("./user.model")(sequelize, DataTypes);
+db.Profile = require("./profile.model")(sequelize, DataTypes);
+db.Post = require("./post.model")(sequelize, DataTypes);
+db.Tag = require("./tag.model")(sequelize, DataTypes);
+db.PostTag = require("./posttag.model")(sequelize, DataTypes);
+
+// Associations
+
+// One-to-One: User ↔ Profile
+db.User.hasOne(db.Profile, { foreignKey: "userId", as: "profile" });
+db.Profile.belongsTo(db.User, { foreignKey: "userId", as: "user" });
+
+// One-to-Many: User → Posts
+db.User.hasMany(db.Post, { foreignKey: "userId", as: "posts" });
+db.Post.belongsTo(db.User, { foreignKey: "userId", as: "user" });
+
+// Many-to-Many: Post ↔ Tag (via PostTag)
+db.Post.belongsToMany(db.Tag, {
+  through: db.PostTag,
+  as: "tags",
+  foreignKey: "postId"
+});
+db.Tag.belongsToMany(db.Post, {
+  through: db.PostTag,
+  as: "posts",
+  foreignKey: "tagId"
+});
 
 module.exports = db;

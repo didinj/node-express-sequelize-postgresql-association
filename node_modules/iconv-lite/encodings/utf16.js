@@ -1,5 +1,5 @@
 "use strict";
-var Buffer = require("buffer").Buffer;
+var Buffer = require("safer-buffer").Buffer;
 
 // Note: UTF16-LE (or UCS2) codec is Node.js native. See encodings/internal.js
 
@@ -20,7 +20,7 @@ function Utf16BEEncoder() {
 }
 
 Utf16BEEncoder.prototype.write = function(str) {
-    var buf = new Buffer(str, 'ucs2');
+    var buf = Buffer.from(str, 'ucs2');
     for (var i = 0; i < buf.length; i += 2) {
         var tmp = buf[i]; buf[i] = buf[i+1]; buf[i+1] = tmp;
     }
@@ -41,7 +41,7 @@ Utf16BEDecoder.prototype.write = function(buf) {
     if (buf.length == 0)
         return '';
 
-    var buf2 = new Buffer(buf.length + 1),
+    var buf2 = Buffer.alloc(buf.length + 1),
         i = 0, j = 0;
 
     if (this.overflowByte !== -1) {
@@ -61,6 +61,7 @@ Utf16BEDecoder.prototype.write = function(buf) {
 }
 
 Utf16BEDecoder.prototype.end = function() {
+    this.overflowByte = -1;
 }
 
 
@@ -103,8 +104,8 @@ Utf16Encoder.prototype.end = function() {
 
 function Utf16Decoder(options, codec) {
     this.decoder = null;
-    this.initialBytes = [];
-    this.initialBytesLen = 0;
+    this.initialBufs = [];
+    this.initialBufsLen = 0;
 
     this.options = options || {};
     this.iconv = codec.iconv;
@@ -113,17 +114,22 @@ function Utf16Decoder(options, codec) {
 Utf16Decoder.prototype.write = function(buf) {
     if (!this.decoder) {
         // Codec is not chosen yet. Accumulate initial bytes.
-        this.initialBytes.push(buf);
-        this.initialBytesLen += buf.length;
+        this.initialBufs.push(buf);
+        this.initialBufsLen += buf.length;
         
-        if (this.initialBytesLen < 16) // We need more bytes to use space heuristic (see below)
+        if (this.initialBufsLen < 16) // We need more bytes to use space heuristic (see below)
             return '';
 
         // We have enough bytes -> detect endianness.
-        var buf = Buffer.concat(this.initialBytes),
-            encoding = detectEncoding(buf, this.options.defaultEncoding);
+        var encoding = detectEncoding(this.initialBufs, this.options.defaultEncoding);
         this.decoder = this.iconv.getDecoder(encoding, this.options);
-        this.initialBytes.length = this.initialBytesLen = 0;
+
+        var resStr = '';
+        for (var i = 0; i < this.initialBufs.length; i++)
+            resStr += this.decoder.write(this.initialBufs[i]);
+
+        this.initialBufs.length = this.initialBufsLen = 0;
+        return resStr;
     }
 
     return this.decoder.write(buf);
@@ -131,47 +137,61 @@ Utf16Decoder.prototype.write = function(buf) {
 
 Utf16Decoder.prototype.end = function() {
     if (!this.decoder) {
-        var buf = Buffer.concat(this.initialBytes),
-            encoding = detectEncoding(buf, this.options.defaultEncoding);
+        var encoding = detectEncoding(this.initialBufs, this.options.defaultEncoding);
         this.decoder = this.iconv.getDecoder(encoding, this.options);
 
-        var res = this.decoder.write(buf),
-            trail = this.decoder.end();
+        var resStr = '';
+        for (var i = 0; i < this.initialBufs.length; i++)
+            resStr += this.decoder.write(this.initialBufs[i]);
 
-        return trail ? (res + trail) : res;
+        var trail = this.decoder.end();
+        if (trail)
+            resStr += trail;
+
+        this.initialBufs.length = this.initialBufsLen = 0;
+        return resStr;
     }
     return this.decoder.end();
 }
 
-function detectEncoding(buf, defaultEncoding) {
-    var enc = defaultEncoding || 'utf-16le';
+function detectEncoding(bufs, defaultEncoding) {
+    var b = [];
+    var charsProcessed = 0;
+    var asciiCharsLE = 0, asciiCharsBE = 0; // Number of ASCII chars when decoded as LE or BE.
 
-    if (buf.length >= 2) {
-        // Check BOM.
-        if (buf[0] == 0xFE && buf[1] == 0xFF) // UTF-16BE BOM
-            enc = 'utf-16be';
-        else if (buf[0] == 0xFF && buf[1] == 0xFE) // UTF-16LE BOM
-            enc = 'utf-16le';
-        else {
-            // No BOM found. Try to deduce encoding from initial content.
-            // Most of the time, the content has ASCII chars (U+00**), but the opposite (U+**00) is uncommon.
-            // So, we count ASCII as if it was LE or BE, and decide from that.
-            var asciiCharsLE = 0, asciiCharsBE = 0, // Counts of chars in both positions
-                _len = Math.min(buf.length - (buf.length % 2), 64); // Len is always even.
+    outer_loop:
+    for (var i = 0; i < bufs.length; i++) {
+        var buf = bufs[i];
+        for (var j = 0; j < buf.length; j++) {
+            b.push(buf[j]);
+            if (b.length === 2) {
+                if (charsProcessed === 0) {
+                    // Check BOM first.
+                    if (b[0] === 0xFF && b[1] === 0xFE) return 'utf-16le';
+                    if (b[0] === 0xFE && b[1] === 0xFF) return 'utf-16be';
+                }
 
-            for (var i = 0; i < _len; i += 2) {
-                if (buf[i] === 0 && buf[i+1] !== 0) asciiCharsBE++;
-                if (buf[i] !== 0 && buf[i+1] === 0) asciiCharsLE++;
+                if (b[0] === 0 && b[1] !== 0) asciiCharsBE++;
+                if (b[0] !== 0 && b[1] === 0) asciiCharsLE++;
+
+                b.length = 0;
+                charsProcessed++;
+
+                if (charsProcessed >= 100) {
+                    break outer_loop;
+                }
             }
-
-            if (asciiCharsBE > asciiCharsLE)
-                enc = 'utf-16be';
-            else if (asciiCharsBE < asciiCharsLE)
-                enc = 'utf-16le';
         }
     }
 
-    return enc;
+    // Make decisions.
+    // Most of the time, the content has ASCII chars (U+00**), but the opposite (U+**00) is uncommon.
+    // So, we count ASCII as if it was LE or BE, and decide from that.
+    if (asciiCharsBE > asciiCharsLE) return 'utf-16be';
+    if (asciiCharsBE < asciiCharsLE) return 'utf-16le';
+
+    // Couldn't decide (likely all zeros or not enough data).
+    return defaultEncoding || 'utf-16le';
 }
 
 
